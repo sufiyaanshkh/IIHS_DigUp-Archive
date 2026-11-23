@@ -1,0 +1,5 @@
+Authlib==1.9.10
+argon2-cffi>=23.1,<26
+fastapi>=0.115,<1
+httpx2==2.16.2
+uvicorn>=0.30,<1
