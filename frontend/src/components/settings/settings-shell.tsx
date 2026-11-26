@@ -183,11 +183,11 @@ function Panel({ title, detail, children }: { title: string; detail?: string; ch
 
 function GeneralPanel({ settings }: { settings: SettingsData["general"] }) {
   return <>
-    <Panel title="Indexing" detail="This browser adapter starts DigUp indexing when you choose Index sources in the archive toolbar.">
+    <Panel title="Indexing" detail="Web indexing is disabled because incomplete folder enumeration can remove indexed records.">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-sm font-medium text-ink">Current behavior</p>
-          <p className="mt-1 text-xs text-ink/55">Manual · no background watcher is running in the web adapter.</p>
+          <p className="mt-1 text-xs text-ink/55">No indexing or background watcher is started by the web adapter.</p>
         </div>
         <span className="rounded-full bg-sand-light px-3 py-1 text-[11px] font-medium text-ink/70">{settings.indexing_behavior}</span>
       </div>
@@ -203,8 +203,9 @@ function GeneralPanel({ settings }: { settings: SettingsData["general"] }) {
   </>;
 }
 
-function LocationList({ title, empty, items, onRemove, disabled }: {
+function LocationList({ title, empty, items, onRemove, disabled, confirmRootRemoval = false }: {
   title: string; empty: string; items: ConfiguredFolder[]; onRemove: (id: string) => void; disabled: boolean;
+  confirmRootRemoval?: boolean;
 }) {
   return <div>
     <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink/55">{title}</h3>
@@ -217,7 +218,10 @@ function LocationList({ title, empty, items, onRemove, disabled }: {
           </div>
           <div className="flex shrink-0 items-center gap-3">
             <span className={`text-xs font-medium ${item.available ? "text-emerald-800" : "text-brick"}`}>{item.available ? "Available" : "Disconnected"}</span>
-            <button type="button" disabled={disabled} onClick={() => onRemove(item.id)} aria-label={`Remove ${item.name}`} className="grid size-8 place-items-center rounded-md text-ink/45 hover:bg-sand-light hover:text-brick focus-visible:outline-2 focus-visible:outline-brick disabled:opacity-40">
+            <button type="button" disabled={disabled} onClick={() => {
+              if (confirmRootRemoval && !window.confirm(`Remove "${item.name}" from the configured roots? Search visibility changes immediately. Exclusions without a remaining root are also removed, and an external indexing run may remove index records. Source files are not deleted.`)) return;
+              onRemove(item.id);
+            }} aria-label={`Remove ${item.name}`} className="grid size-8 place-items-center rounded-md text-ink/45 hover:bg-sand-light hover:text-brick focus-visible:outline-2 focus-visible:outline-brick disabled:opacity-40">
               <X aria-hidden="true" className="size-4" />
             </button>
           </div>
@@ -251,7 +255,7 @@ function FoldersPanel({ settings, volumes, busy, onChange, onBrowseRoot, onBrows
         </ul>}
     </Panel>
     <Panel title="Folders to index" detail="Configured roots are saved immediately. Disconnected roots remain listed and are rechecked before indexing.">
-      <LocationList title="Included roots" empty="No folders selected yet." items={settings.roots} disabled={busy}
+      <LocationList title="Included roots" empty="No folders selected yet." items={settings.roots} disabled={busy} confirmRootRemoval
         onRemove={(id) => void onChange(() => settingsApi.removeRoot("folders", id))} />
       <Button type="button" size="small" disabled={busy} className="mt-3" onClick={onBrowseRoot}>Add a folder</Button>
     </Panel>
@@ -287,8 +291,8 @@ function CodePanel({ settings, busy, onChange, onBrowseRoot, onBrowseExclusion }
         <span className="rounded-full bg-sand-light px-3 py-1 text-[11px] text-ink/65">Separate code index</span>
       </div>
     </Panel>
-    <Panel title="Code folders" detail="These settings are sent to DigUp's original IndexService. Selecting a folder does not start indexing.">
-      <LocationList title="Included code roots" empty="No code folders selected." items={settings.roots} disabled={busy}
+    <Panel title="Code folders" detail="These settings configure code search. Web indexing is disabled; selecting a folder does not start indexing.">
+      <LocationList title="Included code roots" empty="No code folders selected." items={settings.roots} disabled={busy} confirmRootRemoval
         onRemove={(id) => void onChange(() => settingsApi.removeRoot("code", id))} />
       <Button type="button" size="small" disabled={busy} className="mt-3" onClick={onBrowseRoot}>Add a code folder</Button>
     </Panel>

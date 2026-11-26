@@ -131,7 +131,7 @@ class SettingsService:
     def general(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "indexing_behavior": "manual",
+                "indexing_behavior": "disabled",
                 "automatic_indexing_available": False,
                 "desktop_only": [
                     {"name": "Search shortcut", "desktop_default": "Command + Shift + Space"},
@@ -150,6 +150,10 @@ class SettingsService:
                 "excluded_folders": [self._public_entry(item) for item in self._document.excluded_folders],
                 "excluded_extensions": list(self._document.excluded_extensions),
             }
+
+    def configured_archive_roots(self) -> list[PathEntry]:
+        with self._lock:
+            return [item.model_copy(deep=True) for item in self._document.roots]
 
     def code(self, *, index_status: dict[str, Any] | None = None,
              indexing_available: bool = False) -> dict[str, Any]:

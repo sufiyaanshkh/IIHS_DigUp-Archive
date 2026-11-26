@@ -7,7 +7,7 @@ export type ConfiguredFolder = {
 };
 
 export type GeneralSettings = {
-  indexing_behavior: "manual";
+  indexing_behavior: "disabled";
   automatic_indexing_available: boolean;
   desktop_only: Array<{ name: string; desktop_default: string }>;
 };

@@ -1,4 +1,4 @@
-import type { EngineStatus, ImageMetadata, IndexingStatus, MediaMetadata, SearchKind, SearchMode, SearchResponse, SearchScope } from "@/lib/archive-types";
+import type { ArchiveListing, EnginePrewarm, EngineReload, EngineStatus, ImageMetadata, IndexingStatus, MediaMetadata, SearchKind, SearchMode, SearchResponse, SearchScope } from "@/lib/archive-types";
 import { authApi } from "@/lib/auth-api";
 
 async function request<T>(path: string, init?: RequestInit, csrf = false): Promise<T> {
@@ -28,16 +28,25 @@ export class ArchiveApiError extends Error {
 }
 
 export const archiveApi = {
+  browseArchive: (params: URLSearchParams, signal?: AbortSignal) => request<ArchiveListing>(`/api/archive?${params.toString()}`, { signal }),
   health: () => request<{ status: string; digup_cli_available: boolean; models_available: boolean; search_service_running: boolean; index_job_state: string }>("/api/health"),
   engineStatus: () => request<EngineStatus>("/api/engine/status"),
-  search: (query: string, mode: SearchMode, scope: SearchScope = "archive", kinds: SearchKind[] | null = null, limit = 100) => request<SearchResponse>("/api/search", {
+  prewarm: () => request<EnginePrewarm>("/api/engine/prewarm", { method: "POST" }, true),
+  reloadSearch: () => request<EngineReload>("/api/engine/reload", { method: "POST" }, true),
+  search: (query: string, mode: SearchMode, scope: SearchScope = "archive", kinds: SearchKind[] | null = null, limit = 100, prefixLast = false, signal?: AbortSignal) => request<SearchResponse>("/api/search", {
     method: "POST",
+    signal,
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, mode, scope, kinds, limit }),
+    body: JSON.stringify({ query, mode, scope, kinds, limit, prefix_last: prefixLast }),
   }),
   indexingStatus: () => request<IndexingStatus>("/api/indexing/status"),
   startIndexing: () => request<IndexingStatus>("/api/indexing/sync", { method: "POST" }, true),
   stopIndexing: () => request<IndexingStatus>("/api/indexing/stop", { method: "POST" }, true),
+  setBackfill: (enabled: boolean) => request<IndexingStatus>("/api/indexing/backfill", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  }, true),
   mediaMetadata: (handle: string) => request<MediaMetadata>(`/api/media/${encodeURIComponent(handle)}`),
   imageMetadata: (handle: string) => request<ImageMetadata>(`/api/media/${encodeURIComponent(handle)}/image-metadata`),
   mediaStreamUrl: (handle: string) => `/api/media/${encodeURIComponent(handle)}/stream`,

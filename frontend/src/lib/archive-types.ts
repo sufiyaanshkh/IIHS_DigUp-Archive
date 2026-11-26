@@ -37,6 +37,26 @@ export type SearchResponse = {
 };
 
 export type ArchiveResult = SearchHit & { details: string };
+export type ArchiveSource = { id: string; name: string; location: string; relative_path: string; available: boolean };
+export type ArchiveFolder = { name: string; relative_path: string; file_count: number | null };
+export type ArchiveItem = SearchHit & {
+  relative_path: string;
+  source_id: string;
+  source_name: string;
+  processing_state: "done" | "partial" | "pending" | "failed" | "skipped" | "unindexed" | "unknown";
+};
+export type ArchiveListing = {
+  sources: ArchiveSource[];
+  source_id: string | null;
+  folder: string | null;
+  breadcrumbs: ArchiveFolder[];
+  folders: ArchiveFolder[];
+  items: ArchiveItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  schema_version: number | null;
+};
 export type ResultFilter = "all" | "screenshot" | "image" | "document" | "video" | "audio";
 
 export type EngineStatus = {
@@ -53,6 +73,9 @@ export type EngineStatus = {
   indexing: IndexingStatus;
 };
 
+export type EnginePrewarm = { encoder: "stopped" | "starting" | "ready" | "unavailable"; vectors: number };
+export type EngineReload = { vectors: number; code_vectors: number };
+
 export type IndexEvent = { event: string; [key: string]: string | number | boolean | undefined };
 export type IndexedFileEvent = {
   name: string;
@@ -64,6 +87,8 @@ export type IndexedFileEvent = {
 
 export type IndexingStatus = {
   state: "idle" | "starting" | "scanning" | "indexing" | "waiting" | "completed" | "stopping" | "stopped" | "failed";
+  sync_available: boolean;
+  sync_unavailable_reason?: string;
   job_id: string | null;
   started_at?: number;
   finished_at?: number;
@@ -74,6 +99,7 @@ export type IndexingStatus = {
   events?: IndexEvent[];
   error?: string | null;
   search_reload?: string;
+  backfill_requested?: boolean;
   summary_available?: boolean;
   roots?: Array<{
     source: string;
@@ -138,9 +164,10 @@ export function toArchiveResult(hit: SearchHit): ArchiveResult {
   const kind = hit.engine_kind === "pdf" || hit.engine_kind === "doc" ? "Document" : hit.kind;
   const modified = hit.modified ? new Date(hit.modified * 1000).toLocaleDateString() : "Date unavailable";
   const size = hit.size > 0 ? formatBytes(hit.size) : "Size unavailable";
-  const preview_url = hit.engine_kind === "pdf" && hit.preview_url && hit.loc === null
-    ? `${hit.preview_url}?loc=1`
-    : hit.preview_url;
+  const page = (hit.segment === "page" || hit.segment === "page_image") && hit.loc != null && hit.loc >= 1
+    ? Math.floor(hit.loc) : 1;
+  const preview_url = hit.engine_kind === "pdf" && hit.preview_url
+    ? `${hit.preview_url}?loc=${page}` : hit.preview_url;
   return { ...hit, preview_url, details: `${kind} · ${modified} · ${size}` };
 }
 

@@ -45,6 +45,7 @@ class MediaReference:
     session_id: str
     expires_at: float
     code: bool = False
+    archive: bool = False
 
 
 class SearchProcess:
@@ -164,6 +165,10 @@ class SearchProcess:
         except asyncio.TimeoutError as exc:
             self._pending.pop(request_id, None)
             raise DigUpTimeout("DigUp SearchService request timed out") from exc
+        except asyncio.CancelledError:
+            self._pending.pop(request_id, None)
+            future.cancel()
+            raise
         except (BrokenPipeError, ConnectionError, OSError) as exc:
             self._pending.pop(request_id, None)
             raise DigUpUnavailable("DigUp SearchService connection failed") from exc
@@ -206,7 +211,12 @@ class SearchProcess:
 
 
 class IndexJob:
-    """One IndexService owner per configured index; emits a safe, bounded polling snapshot."""
+    """Track web-owned IndexService state; starting new jobs is disabled for safety."""
+
+    SYNC_UNAVAILABLE = (
+        "Indexing is disabled because DigUp cannot verify that every subtree was enumerated; "
+        "an incomplete crawl could remove indexed records."
+    )
 
     def __init__(self, settings: EngineSettings, *, after_sync=None):
         self.settings = settings
@@ -221,28 +231,7 @@ class IndexJob:
         async with self._lock:
             if self._task and not self._task.done():
                 raise DigUpConflict("An indexing job is already running")
-            if not self.settings.executable_available:
-                raise DigUpUnavailable("DigUp CLI executable is unavailable")
-            if not self.settings.roots and not self.settings.code_roots:
-                raise ValueError("No archive or code roots are configured")
-            roots = (*self.settings.roots, *self.settings.code_roots)
-            if any(root.is_symlink() or not root.is_dir() for root in roots):
-                raise ValueError("A configured indexing folder is unavailable; review Folders settings")
-            for exclusions, parents in (
-                (self.settings.excluded_folders, self.settings.roots),
-                (self.settings.code_excluded_folders, self.settings.code_roots),
-            ):
-                if any(excluded.is_symlink() or not excluded.is_dir() or not any(
-                    excluded != root and excluded.is_relative_to(root) for root in parents
-                ) for excluded in exclusions):
-                    raise ValueError("A configured exclusion is unavailable or outside its indexing folder")
-            self.settings.index_dir.mkdir(parents=True, exist_ok=True)
-            self._stop_requested = False
-            self._state = {"state": "starting", "job_id": uuid.uuid4().hex,
-                           "started_at": time.time(), "events": [], "files": [],
-                           "done": 0, "total": 0, "checked": 0, "error": None}
-            self._task = asyncio.create_task(self._run(self.settings))
-            return self.snapshot()
+            raise DigUpConflict(self.SYNC_UNAVAILABLE)
 
     async def _run(self, settings: EngineSettings) -> None:
         args = [str(settings.executable), "index-service", "--index", str(settings.index_dir),
@@ -284,7 +273,8 @@ class IndexJob:
                     except Exception:
                         self._state["search_reload"] = "pending"
                 self._state["state"] = (
-                    "stopped" if self._stop_requested else "completed" if return_code == 0 else "failed"
+                    "stopped" if self._stop_requested else
+                    "completed" if return_code == 0 and not self._state.get("error") else "failed"
                 )
                 if return_code != 0:
                     self._state["error"] = "DigUp IndexService exited unexpectedly"
@@ -353,9 +343,30 @@ class IndexJob:
                 await self._process.stdin.drain()
             return self.snapshot()
 
+    async def set_backfill(self, enabled: bool) -> dict[str, Any]:
+        async with self._lock:
+            process = self._process
+            if (not self._task or self._task.done() or self._stop_requested or
+                    process is None or process.returncode is not None or process.stdin is None):
+                raise DigUpConflict("An active indexing job is required to change backfill")
+            try:
+                process.stdin.write(b"backfill on\n" if enabled else b"backfill off\n")
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionError, OSError) as exc:
+                raise DigUpUnavailable("Could not send the backfill command to DigUp") from exc
+            self._state["backfill_requested"] = enabled
+            return self.snapshot()
+
+    async def reload_search(self, search_process: SearchProcess) -> dict[str, Any]:
+        async with self._lock:
+            if self._task and not self._task.done():
+                raise DigUpConflict("Wait until the indexing job finishes before reloading search")
+            return await search_process.request("reload")
+
     def snapshot(self) -> dict[str, Any]:
         return dict(self._state, files=list(self._state.get("files", [])),
-                    events=list(self._state.get("events", [])))
+                    events=list(self._state.get("events", [])),
+                    sync_available=False, sync_unavailable_reason=self.SYNC_UNAVAILABLE)
 
     async def close(self) -> None:
         await self.stop()
@@ -396,6 +407,14 @@ class DigUpAdapter:
     async def _reload_search(self) -> None:
         if self.search_process.running:
             await self.search_process.request("reload")
+
+    async def prewarm(self) -> dict[str, Any]:
+        response = await self.search_process.request("prewarm")
+        return {"encoder": response["encoder"], "vectors": response["vectors"]}
+
+    async def reload_search(self) -> dict[str, Any]:
+        response = await self.index_job.reload_search(self.search_process)
+        return {"vectors": response["vectors"], "code_vectors": response["code_vectors"]}
 
     def health(self) -> dict[str, Any]:
         return {"status": "ok", "digup_cli_available": self.settings.executable_available,
@@ -445,22 +464,26 @@ class DigUpAdapter:
         return summaries
 
     async def search(self, query: str, kinds: list[str] | None, mode: str, limit: int,
-                     *, session_id: str, code: bool = False) -> dict[str, Any]:
+                     *, session_id: str, code: bool = False, prefix_last: bool = False) -> dict[str, Any]:
         response = await self.search_process.request(
             "search", q=query, kinds=kinds, limit=limit, meaning=(mode == "hybrid"),
-            prefix_last=False, code=code
+            prefix_last=prefix_last, code=code
         )
         hits = []
+        strong = 0
         self._expire_handles()
-        for raw_hit in response.get("hits", []):
+        for index, raw_hit in enumerate(response.get("hits", [])):
             safe = self._register_hit(raw_hit, session_id, code=code)
             if safe is not None:
                 hits.append(safe)
+                if index < response.get("strong", 0):
+                    strong += 1
         return {"query": query, "mode": mode, "meaning": response.get("meaning", False),
-                "strong": response.get("strong", 0), "timings_ms": response.get("ms", {}),
+                "strong": strong, "timings_ms": response.get("ms", {}),
                 "warning": response.get("warning"), "total": len(hits), "hits": hits}
 
-    def _register_hit(self, hit: dict[str, Any], session_id: str, *, code: bool = False) -> dict[str, Any] | None:
+    def _register_hit(self, hit: dict[str, Any], session_id: str, *, code: bool = False,
+                      root_hint: Path | None = None, archive: bool = False) -> dict[str, Any] | None:
         path_text = hit.get("path")
         if not isinstance(path_text, str) or (hit.get("kind") == "code") != code:
             return None
@@ -468,10 +491,19 @@ class DigUpAdapter:
             actual = Path(path_text).resolve(strict=True)
             roots = self.settings.code_roots if code else self.settings.roots
             exclusions = self.settings.code_excluded_folders if code else self.settings.excluded_folders
-            root = _permitted_root(actual, roots, exclusions)
+            if root_hint is None:
+                root = _permitted_root(actual, roots, exclusions)
+            else:
+                requested_root = root_hint.resolve(strict=True)
+                if archive:
+                    root = _permitted_root(actual, (requested_root,), exclusions)
+                else:
+                    configured_roots = tuple(folder.resolve(strict=True) for folder in roots)
+                    root = _permitted_root(actual, (requested_root,), exclusions) \
+                        if requested_root in configured_roots else None
             if root is None or not actual.is_file():
                 return None
-            if not code and actual.suffix.lower().lstrip(".") in self.settings.excluded_extensions:
+            if not code and not archive and actual.suffix.lower().lstrip(".") in self.settings.excluded_extensions:
                 return None
             relative = actual.relative_to(root)
         except (OSError, ValueError):
@@ -483,14 +515,14 @@ class DigUpAdapter:
         loc = hit.get("loc")
         loc_end = hit.get("loc_end")
         reference = MediaReference(actual, root, hit, session_id,
-                                   time.monotonic() + self.settings.handle_ttl_seconds, code)
+                                   time.monotonic() + self.settings.handle_ttl_seconds, code, archive)
         self._media[handle] = reference
         if len(self._media) > 1000:
             self._expire_handles(force=True)
         display_kind = "document" if kind in ("doc", "pdf") else kind
         if kind == "screenshot":
             display_kind = "screenshot"
-        location = _location(kind, segment, loc)
+        location = _location(kind, segment, loc, loc_end)
         preview = f"/api/media/{handle}/preview"
         if kind == "video":
             preview = f"/api/media/{handle}/frame?at={loc if loc is not None else 0}"
@@ -512,7 +544,7 @@ class DigUpAdapter:
             "mime_type": mimetypes.guess_type(actual.name)[0] or "application/octet-stream",
             "preview_url": preview if kind in ("image", "screenshot", "pdf", "video") else None,
             "download_url": f"/api/media/{handle}/download",
-            "reason": _reason(kind, segment, location),
+            "reason": _reason(kind, segment, loc, loc_end, hit.get("z"), hit.get("keyword_rank")),
         }
 
     def _expire_handles(self, force: bool = False) -> None:
@@ -539,11 +571,12 @@ class DigUpAdapter:
                 except OSError:
                     continue
             root = (_permitted_root(actual, (reference.root,), exclusions)
-                    if reference.root in configured_roots else None)
+                    if reference.archive or reference.root in configured_roots else None)
         except OSError as exc:
             raise MediaNotFound("Media source is unavailable") from exc
         if (not actual.is_file() or root is None or
-                (not reference.code and actual.suffix.lower().lstrip(".") in self.settings.excluded_extensions)):
+                (not reference.code and not reference.archive
+                 and actual.suffix.lower().lstrip(".") in self.settings.excluded_extensions)):
             raise MediaForbidden("Media is outside configured archive roots")
         reference.path = actual
         reference.root = root
@@ -614,7 +647,7 @@ def _safe_event_text(value: str, settings: EngineSettings) -> str:
     return value[:300]
 
 
-def _location(kind: str, segment: str, loc: Any) -> str | None:
+def _location(kind: str, segment: str, loc: Any, loc_end: Any) -> str | None:
     if loc is None:
         return None
     try:
@@ -623,21 +656,52 @@ def _location(kind: str, segment: str, loc: Any) -> str | None:
         return None
     if segment in ("page", "page_image"):
         return f"p. {int(value)}"
-    if segment == "lines":
-        return f"line {int(value)}"
-    if segment == "cells":
-        return f"cell {int(value)}"
+    if segment in ("lines", "cells"):
+        try:
+            end = int(float(loc_end)) if loc_end is not None else int(value)
+        except (TypeError, ValueError):
+            return None
+        start = int(value)
+        unit = "line" if segment == "lines" else "cell"
+        return f"{unit} {start}" if start == end else f"{unit}s {start}–{end}"
     if kind in ("audio", "video"):
         seconds = max(0, int(value))
         return f"{seconds // 60}:{seconds % 60:02d}"
     return None
 
 
-def _reason(kind: str, segment: str, location: str | None) -> str:
-    if segment in ("page", "page_image") and location:
-        return f"Matches content on {location}"
-    if segment in ("frame", "audio") and location:
-        return f"Matches at {location}"
-    if kind in ("image", "screenshot"):
-        return "Matches the image"
-    return "Matches indexed content"
+def _reason(kind: str, segment: str, loc: float | None, loc_end: float | None,
+            z: float | None, keyword_rank: int | None) -> str:
+    if not (z if z is not None else 0) >= 2:
+        return "Has your words" if keyword_rank is not None else "Matches its name"
+    if segment == "image":
+        return "Matches what's on screen" if kind == "screenshot" else "Matches the picture"
+    if segment == "ocr":
+        return "Matches the text in it"
+    if segment in ("frame", "audio"):
+        place = _reason_clock(loc) if loc is not None else ""
+        if segment == "frame":
+            return f"Matches the frame at {place}"
+        return f"Matches the sound at {place}" if kind == "video" else f"Matches what's heard at {place}"
+    if segment in ("page", "page_image"):
+        page = f"page {int(loc)}" if loc is not None else "a page"
+        return f"Matches the text on {page}" if segment == "page" else f"Matches {page}"
+    if segment == "chunk":
+        return "Matches its text"
+    if segment in ("lines", "cells"):
+        if loc is None:
+            return "Matches the code"
+        start = int(loc)
+        end = int(loc_end) if loc_end is not None else start
+        unit = "line" if segment == "lines" else "cell"
+        span = f"{unit} {start}" if start == end else f"{unit}s {start}–{end}"
+        return f"Matches {span}"
+    return "Matches its name"
+
+
+def _reason_clock(seconds: float) -> str:
+    total = int(seconds)
+    if total >= 3600:
+        return f"{total // 3600}:{total // 60 % 60:02d}:{total % 60:02d}"
+    minutes = (abs(total) // 60) * (-1 if total < 0 else 1)
+    return f"{minutes}:{total - minutes * 60:02d}"

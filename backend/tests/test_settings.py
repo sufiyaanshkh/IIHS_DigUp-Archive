@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import stat
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ from app.core.config import Settings
 from app.core.engine_config import EngineSettings
 from app.auth.database import connect
 from app.auth.sessions import SESSION_COOKIE, create_session
-from app.engine.supervisor import DigUpAdapter, IndexJob
+from app.engine.supervisor import DigUpAdapter, DigUpConflict, DigUpUnavailable, IndexJob
 from app.main import create_app
 from app.settings.browser import DirectoryBrowser, DirectoryUnavailable
 from app.settings.schemas import ExtensionUpdate
@@ -68,7 +69,7 @@ class SettingsTests(unittest.TestCase):
         return current
 
     def test_defaults_and_persistence_across_service_restart(self) -> None:
-        self.assertEqual(self.service.general()["indexing_behavior"], "manual")
+        self.assertEqual(self.service.general()["indexing_behavior"], "disabled")
         self.assertEqual(self.service.folders()["roots"], [])
         ref = self.browse_ref(self.volume / "archive")
         self.service.add_root(ref, section="folders")
@@ -195,15 +196,13 @@ class SettingsTests(unittest.TestCase):
             settings.executable.chmod(0o755)
             job.settings = settings
             with patch("asyncio.create_subprocess_exec", new=spawn):
-                await job.start()
-                await job._task
+                await job._run(settings)
                 code_only = EngineSettings(
                     executable=settings.executable, index_dir=settings.index_dir, model_dir=settings.model_dir,
                     roots=(), code_roots=(code_root,), code_excluded_folders=(code_root / "build",),
                 )
                 code_job = IndexJob(code_only)
-                await code_job.start()
-                await code_job._task
+                await code_job._run(code_only)
 
         asyncio.run(verify())
         self.assertIn("--prune", captured[0])
@@ -214,17 +213,176 @@ class SettingsTests(unittest.TestCase):
         self.assertIn(str(root), captured[0])
         self.assertNotIn("--prune", captured[1])
 
-    def test_indexing_refuses_disconnected_roots_before_starting_process(self) -> None:
+    def test_indexing_refuses_every_root_before_starting_process(self) -> None:
         async def verify() -> None:
-            settings = EngineSettings(
-                executable=self.workspace / "digup", index_dir=self.workspace / "index",
-                model_dir=self.workspace / "models", roots=(self.workspace / "missing",),
-            )
-            settings.executable.touch()
-            settings.executable.chmod(0o755)
-            job = IndexJob(settings)
-            with self.assertRaisesRegex(ValueError, "unavailable"):
-                await job.start()
+            for root in (self.workspace / "missing", self.volume / "archive"):
+                settings = EngineSettings(
+                    executable=self.workspace / "digup", index_dir=self.workspace / "index",
+                    model_dir=self.workspace / "models", roots=(root,),
+                )
+                job = IndexJob(settings)
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as spawn:
+                    with self.assertRaisesRegex(DigUpConflict, "incomplete crawl"):
+                        await job.start()
+                    spawn.assert_not_awaited()
+                self.assertFalse(job.snapshot()["sync_available"])
+                self.assertFalse(settings.index_dir.exists())
+
+        asyncio.run(verify())
+
+    def test_sync_api_preserves_existing_synthetic_index(self) -> None:
+        settings = Settings(None, None, None, None, 43200, True, "https://testserver")
+        db_path = self.workspace / "auth.sqlite"
+        index_dir = self.engine.index_dir
+        index_dir.mkdir()
+        index_path = index_dir / "index.sqlite"
+        indexed_path = str(self.volume / "archive" / "disconnected" / "file.txt")
+        with sqlite3.connect(index_path) as db:
+            db.execute("CREATE TABLE files (path TEXT PRIMARY KEY)")
+            db.execute("INSERT INTO files VALUES (?)", (indexed_path,))
+        before = index_path.read_bytes()
+        app = create_app(settings, str(db_path), engine_settings=self.engine,
+                         settings_path=str(self.path), settings_service=self.service)
+        with TestClient(app, base_url="https://testserver") as client:
+            self.assertEqual(client.post("/api/indexing/sync").status_code, 401)
+            employee_csrf = self._login(client, db_path, settings, role="EMPLOYEE")
+            self.assertEqual(client.post("/api/indexing/sync", headers={
+                "origin": "https://testserver", "x-csrf-token": employee_csrf,
+            }).status_code, 403)
+            csrf = self._login(client, db_path, settings)
+            headers = {"origin": "https://testserver", "x-csrf-token": csrf}
+            self.assertEqual(client.post("/api/indexing/sync").status_code, 403)
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as spawn:
+                response = client.post("/api/indexing/sync", headers=headers)
+                self.assertEqual(response.status_code, 409)
+                self.assertIn("incomplete crawl", response.json()["detail"])
+                spawn.assert_not_awaited()
+        self.assertEqual(index_path.read_bytes(), before)
+        self.assertEqual({entry.name for entry in index_dir.iterdir()}, {"index.sqlite"})
+        with sqlite3.connect(index_path) as db:
+            self.assertEqual(db.execute("SELECT path FROM files").fetchall(), [(indexed_path,)])
+
+    def test_backfill_commands_require_a_live_job_and_preserve_requested_state_on_failure(self) -> None:
+        async def verify() -> None:
+            job = IndexJob(self.engine)
+            with self.assertRaises(DigUpConflict):
+                await job.set_backfill(False)
+            writes = []
+            class Input:
+                def write(self, data: bytes) -> None:
+                    writes.append(data)
+
+                async def drain(self) -> None:
+                    pass
+            class Process:
+                stdin = Input()
+                returncode = None
+            task = asyncio.create_task(asyncio.sleep(60))
+            job._task = task
+            job._process = Process()
+            try:
+                self.assertFalse((await job.set_backfill(False))["backfill_requested"])
+                self.assertTrue((await job.set_backfill(True))["backfill_requested"])
+                self.assertEqual(writes, [b"backfill off\n", b"backfill on\n"])
+                job._process.stdin.drain = AsyncMock(side_effect=BrokenPipeError())
+                with self.assertRaises(DigUpUnavailable):
+                    await job.set_backfill(False)
+                self.assertTrue(job.snapshot()["backfill_requested"])
+                job._stop_requested = True
+                with self.assertRaises(DigUpConflict):
+                    await job.set_backfill(False)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(verify())
+
+    def test_backfill_route_requires_operator_and_csrf(self) -> None:
+        settings = Settings(None, None, None, None, 43200, True, "https://testserver")
+        db_path = self.workspace / "auth.sqlite"
+        app = create_app(settings, str(db_path), engine_settings=self.engine,
+                         settings_path=str(self.path), settings_service=self.service)
+        with TestClient(app, base_url="https://testserver") as client:
+            self.assertEqual(client.post("/api/indexing/backfill", json={"enabled": False}).status_code, 401)
+            csrf = self._login(client, db_path, settings)
+            headers = {"origin": "https://testserver", "x-csrf-token": csrf}
+            self.assertEqual(client.post("/api/indexing/backfill", json={"enabled": False}).status_code, 403)
+            self.assertEqual(client.post("/api/indexing/backfill", json={"enabled": "false"}, headers=headers).status_code, 422)
+            self.assertEqual(client.post("/api/indexing/backfill", json={"enabled": False}, headers=headers).status_code, 409)
+            with patch.object(app.state.digup.index_job, "set_backfill",
+                              new=AsyncMock(return_value={"state": "indexing", "backfill_requested": False})) as backfill:
+                result = client.post("/api/indexing/backfill", json={"enabled": False}, headers=headers)
+                self.assertEqual(result.status_code, 200)
+                self.assertFalse(result.json()["backfill_requested"])
+                backfill.assert_awaited_once_with(False)
+            csrf = self._login(client, db_path, settings, role="EMPLOYEE")
+            self.assertEqual(client.post("/api/indexing/backfill", json={"enabled": False},
+                                         headers={"origin": "https://testserver", "x-csrf-token": csrf}).status_code, 403)
+
+    def test_engine_controls_require_operator_and_csrf_and_use_original_operations(self) -> None:
+        settings = Settings(None, None, None, None, 43200, True, "https://testserver")
+        db_path = self.workspace / "auth.sqlite"
+        app = create_app(settings, str(db_path), engine_settings=self.engine,
+                         settings_path=str(self.path), settings_service=self.service)
+        with TestClient(app, base_url="https://testserver") as client:
+            for path in ("/api/engine/prewarm", "/api/engine/reload"):
+                self.assertEqual(client.post(path).status_code, 401)
+            csrf = self._login(client, db_path, settings)
+            headers = {"origin": "https://testserver", "x-csrf-token": csrf}
+            for path in ("/api/engine/prewarm", "/api/engine/reload"):
+                self.assertEqual(client.post(path).status_code, 403)
+            with patch.object(app.state.digup.search_process, "request", new=AsyncMock(
+                side_effect=[{"encoder": "unavailable", "vectors": 3},
+                             {"vectors": 4, "code_vectors": 2, "index": "private"}],
+            )) as request:
+                warm = client.post("/api/engine/prewarm", headers=headers)
+                self.assertEqual(warm.json(), {"encoder": "unavailable", "vectors": 3})
+                reload = client.post("/api/engine/reload", headers=headers)
+                self.assertEqual(reload.json(), {"vectors": 4, "code_vectors": 2})
+                self.assertEqual([call.args for call in request.await_args_list], [("prewarm",), ("reload",)])
+            csrf = self._login(client, db_path, settings, role="EMPLOYEE")
+            for path in ("/api/engine/prewarm", "/api/engine/reload"):
+                self.assertEqual(client.post(path, headers={
+                    "origin": "https://testserver", "x-csrf-token": csrf,
+                }).status_code, 403)
+
+    def test_search_reload_is_blocked_while_indexing(self) -> None:
+        async def verify() -> None:
+            job = IndexJob(self.engine)
+            task = asyncio.create_task(asyncio.Event().wait())
+            job._task = task
+            search = type("Search", (), {})()
+            search.request = AsyncMock(return_value={"vectors": 1, "code_vectors": 0})
+            try:
+                with self.assertRaises(DigUpConflict):
+                    await job.reload_search(search)
+                search.request.assert_not_awaited()
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self.assertEqual(await job.reload_search(search), {"vectors": 1, "code_vectors": 0})
+            search.request.assert_awaited_once_with("reload")
+        asyncio.run(verify())
+
+    def test_sync_error_remains_failed_after_later_idle_event(self) -> None:
+        class Output:
+            async def __aiter__(self):
+                yield b'{"event":"error","message":"sync failed"}\n'
+                yield b'{"event":"idle"}\n'
+        class Process:
+            stdin = None
+            stdout = Output()
+            stderr = None
+
+            async def wait(self) -> int:
+                return 0
+
+        async def verify() -> None:
+            job = IndexJob(self.engine, after_sync=AsyncMock())
+            with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=Process())):
+                await job._run(self.engine)
+            self.assertEqual(job.snapshot()["state"], "failed")
+            self.assertEqual(job.snapshot()["error"], "sync failed")
 
         asyncio.run(verify())
 
@@ -281,6 +439,24 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(kwargs["types"], ["tmp"])
         self.assertEqual(kwargs["code_roots"], [str(self.volume / "code")])
         self.assertEqual(kwargs["code_skipped"], [str(self.volume / "code" / "build")])
+
+    def test_changing_roots_does_not_start_indexing(self) -> None:
+        settings = Settings(None, None, None, None, 43200, True, "https://testserver")
+        db_path = self.workspace / "auth.sqlite"
+        app = create_app(settings, str(db_path), engine_settings=self.engine,
+                         settings_path=str(self.path), settings_service=self.service)
+        with TestClient(app, base_url="https://testserver") as client:
+            csrf = self._login(client, db_path, settings)
+            headers = {"origin": "https://testserver", "x-csrf-token": csrf}
+            root_ref = self.browse_ref(self.volume / "archive")
+            with patch.object(app.state.digup.index_job, "start", new=AsyncMock()) as start:
+                added = client.post("/api/settings/folders/roots",
+                                    json={"directory_ref": root_ref}, headers=headers)
+                self.assertEqual(added.status_code, 200, added.text)
+                root_id = added.json()["roots"][0]["id"]
+                removed = client.delete(f"/api/settings/folders/roots/{root_id}", headers=headers)
+                self.assertEqual(removed.status_code, 200, removed.text)
+                start.assert_not_awaited()
 
 
 if __name__ == "__main__":

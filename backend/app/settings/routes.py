@@ -149,8 +149,10 @@ async def read_code(request: Request):
         }
     except (DigUpTimeout, DigUpUnavailable):
         pass
-    return settings.code(index_status=status,
-                         indexing_available=health["digup_cli_available"] and health["models_available"])
+    return settings.code(index_status=status, indexing_available=(
+        health["digup_cli_available"] and health["models_available"]
+        and request.app.state.digup.index_job.snapshot()["sync_available"]
+    ))
 
 
 @router.post("/code/roots")

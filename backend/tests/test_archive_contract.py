@@ -22,7 +22,7 @@ from app.auth.sessions import SESSION_COOKIE, create_session
 from app.api.routes.archive import router
 from app.core.config import Settings
 from app.core.engine_config import EngineSettings
-from app.engine.supervisor import DigUpAdapter, MediaForbidden, MediaNotFound
+from app.engine.supervisor import DigUpAdapter, MediaForbidden, MediaNotFound, SearchProcess
 from app.main import create_app
 from app.schemas.archive import SearchRequest
 
@@ -58,14 +58,19 @@ class ArchiveContractTests(unittest.TestCase):
 
     def test_openapi_exposes_archive_and_settings_contracts(self) -> None:
         with self.client() as client:
-            paths = client.get("/openapi.json").json()["paths"]
+            specification = client.get("/openapi.json").json()
+            paths = specification["paths"]
         expected = {
             "/api/health": {"get"},
             "/api/engine/status": {"get"},
+            "/api/engine/prewarm": {"post"},
+            "/api/engine/reload": {"post"},
             "/api/search": {"post"},
+            "/api/archive": {"get"},
             "/api/indexing/status": {"get"},
             "/api/indexing/sync": {"post"},
             "/api/indexing/stop": {"post"},
+            "/api/indexing/backfill": {"post"},
             "/api/media/{handle}": {"get"},
             "/api/media/{handle}/image-metadata": {"get"},
             "/api/media/{handle}/checksum": {"get"},
@@ -97,17 +102,21 @@ class ArchiveContractTests(unittest.TestCase):
             "/api/admin/registration": {"get", "put"},
         }
         self.assertEqual({path: set(ops) for path, ops in paths.items() if path.startswith("/api/")}, expected)
+        status = specification["components"]["schemas"]["IndexingStatus"]
+        self.assertIn("sync_available", status["required"])
+        self.assertEqual(status["properties"]["sync_available"]["type"], "boolean")
+        self.assertIn("409", paths["/api/indexing/sync"]["post"]["responses"])
 
     def test_frontend_archive_client_calls_only_routes_present_in_openapi(self) -> None:
         source = FRONTEND_API.read_text(encoding="utf-8")
         with self.client() as client:
             paths = client.get("/openapi.json").json()["paths"]
         for path in (
-            "/api/health", "/api/engine/status", "/api/search", "/api/indexing/status",
+            "/api/health", "/api/engine/status", "/api/search", "/api/archive", "/api/indexing/status",
             "/api/indexing/sync", "/api/indexing/stop", "/api/media/",
         ):
             self.assertIn(path, source)
-        for path in ("/api/health", "/api/engine/status", "/api/search", "/api/indexing/status",
+        for path in ("/api/health", "/api/engine/status", "/api/search", "/api/archive", "/api/indexing/status",
                      "/api/indexing/sync", "/api/indexing/stop"):
             self.assertIn(path, paths)
         self.assertIn("/api/media/{handle}", paths)
@@ -152,7 +161,7 @@ class ArchiveContractTests(unittest.TestCase):
             "meaning": False, "strong": 1, "hits": [{
                 "path": str(media), "kind": "doc", "segment": "name", "loc": None,
                 "loc_end": None, "info": {"pages": "2"}, "excerpt": "metadata fixture",
-                "score": 1.0, "modified": 100, "size": media.stat().st_size,
+                "score": 1.0, "keyword_rank": 1, "modified": 100, "size": media.stat().st_size,
             }],
         })
         app = create_app(self.settings, str(self.auth_db), engine_settings=engine, digup=adapter)
@@ -169,6 +178,7 @@ class ArchiveContractTests(unittest.TestCase):
             hit = client.post("/api/search", json={"query": "metadata", "mode": "keyword"}).json()["hits"][0]
             metadata_response = client.get(f"/api/media/{hit['id']}")
 
+        self.assertEqual(hit["reason"], "Has your words")
         self.assertEqual(metadata_response.status_code, 200)
         body = metadata_response.json()
         frontend_types = FRONTEND_TYPES.read_text(encoding="utf-8")
@@ -222,6 +232,50 @@ class ArchiveContractTests(unittest.TestCase):
         self.assertNotIn("path", result["hits"][0])
         self.assertNotIn(str(self.root), str(result))
 
+    def test_match_reasons_follow_desktop_signals_and_segments(self) -> None:
+        media = self.root / "fixture"
+        media.write_text("synthetic", encoding="utf-8")
+        adapter = DigUpAdapter(EngineSettings(
+            executable=self.workspace / "missing-digup", index_dir=self.index,
+            model_dir=self.workspace / "models", roots=(self.root,), code_roots=(self.root,),
+        ))
+        cases = [
+            ({}, "Matches its name"),
+            ({"z": None, "keyword_rank": None}, "Matches its name"),
+            ({"z": None, "keyword_rank": 0}, "Has your words"),
+            ({"z": 1.999999, "keyword_rank": 1, "score": 500}, "Has your words"),
+            ({"z": 1.999999}, "Matches its name"),
+            ({"z": 2, "keyword_rank": 1, "segment": "image", "kind": "image"}, "Matches the picture"),
+            ({"z": 2.001, "segment": "image", "kind": "screenshot"}, "Matches what's on screen"),
+            ({"z": 2, "segment": "ocr"}, "Matches the text in it"),
+            ({"z": 2, "segment": "frame", "loc": 65.9}, "Matches the frame at 1:05"),
+            ({"z": 2, "segment": "frame", "loc": 3661}, "Matches the frame at 1:01:01"),
+            ({"z": 2, "segment": "frame"}, "Matches the frame at "),
+            ({"z": 2, "segment": "audio", "kind": "video", "loc": 6}, "Matches the sound at 0:06"),
+            ({"z": 2, "segment": "audio", "kind": "audio", "loc": 6}, "Matches what's heard at 0:06"),
+            ({"z": 2, "segment": "audio"}, "Matches what's heard at "),
+            ({"z": 2, "segment": "page", "loc": 3.9}, "Matches the text on page 3"),
+            ({"z": 2, "segment": "page"}, "Matches the text on a page"),
+            ({"z": 2, "segment": "page_image", "loc": 3}, "Matches page 3"),
+            ({"z": 2, "segment": "page_image"}, "Matches a page"),
+            ({"z": 2, "segment": "chunk"}, "Matches its text"),
+            ({"z": 2, "segment": "name"}, "Matches its name"),
+            ({"z": 2, "segment": "unknown"}, "Matches its name"),
+            ({"z": 2, "segment": "lines", "kind": "code", "loc": 12}, "Matches line 12"),
+            ({"z": 2, "segment": "lines", "kind": "code", "loc": 12, "loc_end": 40}, "Matches lines 12–40"),
+            ({"z": 2, "segment": "cells", "kind": "code", "loc": 3}, "Matches cell 3"),
+            ({"z": 2, "segment": "cells", "kind": "code", "loc": 3, "loc_end": 5}, "Matches cells 3–5"),
+            ({"z": 2, "segment": "lines", "kind": "code"}, "Matches the code"),
+            ({"z": 2, "segment": "cells", "kind": "code"}, "Matches the code"),
+        ]
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                raw = {"path": str(media), "kind": "doc", "segment": "name", **fields}
+                hit = adapter._register_hit(raw, "test-session", code=raw["kind"] == "code")
+                self.assertIsNotNone(hit)
+                assert hit is not None
+                self.assertEqual(hit["reason"], expected)
+
     def test_keyword_mode_disables_meaning_in_original_protocol(self) -> None:
         engine = EngineSettings(
             executable=self.workspace / "missing-digup", index_dir=self.index,
@@ -235,6 +289,141 @@ class ArchiveContractTests(unittest.TestCase):
         self.assertIs(adapter.search_process.request.await_args.kwargs["meaning"], False)
         self.assertEqual(result["mode"], "keyword")
         self.assertEqual(result["hits"], [])
+
+    def test_prefix_search_uses_original_protocol_without_changing_other_options(self) -> None:
+        adapter = DigUpAdapter(EngineSettings(
+            executable=self.workspace / "missing", index_dir=self.index,
+            model_dir=self.workspace / "models", roots=(self.root,),
+        ))
+        adapter.search_process.request = AsyncMock(return_value={"meaning": False, "strong": 0, "hits": []})
+        asyncio.run(adapter.search("cat", ["doc"], "keyword", 20, session_id="test", prefix_last=True))
+        kwargs = adapter.search_process.request.await_args.kwargs
+        self.assertEqual((kwargs["q"], kwargs["kinds"], kwargs["limit"]), ("cat", ["doc"], 20))
+        self.assertIs(kwargs["meaning"], False)
+        self.assertIs(kwargs["prefix_last"], True)
+        self.assertFalse(SearchRequest(query="cat").prefix_last)
+        with self.assertRaises(ValidationError):
+            SearchRequest(query="cat", prefix_last="true")
+
+    def test_cancelled_helper_request_clears_its_pending_future(self) -> None:
+        async def exercise() -> None:
+            process = SearchProcess(EngineSettings(
+                executable=self.workspace / "missing", index_dir=self.index,
+                model_dir=self.workspace / "models", roots=(self.root,),
+            ))
+            class Input:
+                def write(self, data: bytes) -> None:
+                    pass
+                async def drain(self) -> None:
+                    pass
+            class Child:
+                stdin = Input()
+            process.process = Child()
+            process._start = AsyncMock()
+            task = asyncio.create_task(process.request("search", q="cat"))
+            await asyncio.sleep(0)
+            self.assertEqual(len(process._pending), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(process._pending, {})
+        asyncio.run(exercise())
+
+    def test_strong_boundary_tracks_only_retained_original_strong_hits(self) -> None:
+        strong = self.root / "strong.txt"
+        weak = self.root / "weak.txt"
+        excluded = self.root / "excluded.txt"
+        for path in (strong, weak, excluded):
+            path.write_text("synthetic", encoding="utf-8")
+        engine = EngineSettings(
+            executable=self.workspace / "missing-digup", index_dir=self.index,
+            model_dir=self.workspace / "models", roots=(self.root,),
+            excluded_folders=(excluded,),
+        )
+        adapter = DigUpAdapter(engine)
+        adapter.search_process.request = AsyncMock(return_value={
+            "meaning": True, "strong": 3,
+            "hits": [
+                {"path": str(self.workspace / "missing.txt"), "kind": "doc"},
+                {"path": str(strong), "kind": "doc"},
+                {"path": str(excluded), "kind": "doc"},
+                {"path": str(weak), "kind": "doc"},
+            ],
+        })
+
+        result = asyncio.run(adapter.search("synthetic", None, "hybrid", 10, session_id="test"))
+
+        self.assertEqual([hit["name"] for hit in result["hits"]], ["strong.txt", "weak.txt"])
+        self.assertEqual(result["strong"], 1)
+        self.assertEqual(result["total"], 2)
+
+        adapter.search_process.request.return_value["strong"] = 1
+        result = asyncio.run(adapter.search("synthetic", None, "hybrid", 10, session_id="test"))
+        self.assertEqual(result["strong"], 0)
+        self.assertEqual(result["total"], 2)
+
+    @unittest.skipUnless(CLI.is_file(), "the original DigUp CLI is not built")
+    def test_real_engine_prefix_and_hybrid_fallback_use_disposable_index(self) -> None:
+        models = self.workspace / "models"
+        models.mkdir()
+        env = {**os.environ, "HOME": str(self.workspace), "TMPDIR": str(self.workspace), "DIGUP_MODELS": str(models)}
+        subprocess.run(
+            [str(CLI), "search-service", "--index", str(self.index), str(self.root)],
+            input='{"id":"quit","op":"quit"}\n', capture_output=True, text=True, env=env, timeout=30, check=True,
+        )
+        files = [self.root / "cat.txt", self.root / "category.txt"]
+        for file in files:
+            file.write_text("synthetic", encoding="utf-8")
+        with closing(sqlite3.connect(self.index / "index.sqlite")) as db:
+            for identifier, file in enumerate(files, 1):
+                stat = file.stat()
+                db.execute(
+                    "INSERT INTO files(id,path,kind,size,mtime,inode,device,state,info) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (identifier, str(file), "doc", stat.st_size, stat.st_mtime, stat.st_ino, stat.st_dev, "done", "{}"),
+                )
+                db.execute("INSERT INTO segments(id,file,kind,modality) VALUES(?,?,'name','none')",
+                           (identifier, identifier))
+                db.execute("INSERT INTO fts(rowid,name,body) VALUES(?,?,?)",
+                           (identifier, file.stem, file.stem))
+            db.execute("INSERT INTO segments(id,file,kind,modality) VALUES(3,1,'chunk','none')")
+            db.execute("INSERT INTO fts(rowid,name,body) VALUES(3,'cat','cat')")
+            db.commit()
+        adapter = DigUpAdapter(EngineSettings(executable=CLI, index_dir=self.index, model_dir=models, roots=(self.root,)))
+        async def exercise() -> None:
+            try:
+                prefix = await adapter.search("cat", ["doc"], "keyword", 20, session_id="test", prefix_last=True)
+                final = await adapter.search("cat", ["doc"], "keyword", 20, session_id="test")
+                hybrid = await adapter.search("cat", ["doc"], "hybrid", 20, session_id="test")
+                self.assertEqual({hit["name"] for hit in prefix["hits"]}, {"cat.txt", "category.txt"})
+                self.assertEqual([hit["name"] for hit in final["hits"]], ["cat.txt"])
+                self.assertEqual([hit["name"] for hit in hybrid["hits"]], ["cat.txt"])
+                self.assertTrue(all(hit["reason"] == "Has your words" for hit in prefix["hits"]))
+                self.assertEqual(final["hits"][0]["reason"], "Has your words")
+                self.assertEqual(hybrid["hits"][0]["reason"], "Has your words")
+                self.assertFalse(hybrid["meaning"])
+                self.assertEqual(len(prefix["hits"]), 2)
+                self.assertLessEqual(prefix["strong"], prefix["total"])
+            finally:
+                await adapter.close()
+        with patch.dict(os.environ, {"HOME": str(self.workspace), "TMPDIR": str(self.workspace)}):
+            asyncio.run(exercise())
+            app = create_app(self.settings, str(self.auth_db), engine_settings=EngineSettings(
+                executable=CLI, index_dir=self.index, model_dir=models, roots=(self.root,),
+            ))
+            with TestClient(app) as client:
+                db = connect(self.auth_db)
+                db.execute(
+                    "INSERT INTO users(id,entra_tenant_id,entra_object_id,email,display_name,role,status,created_at,updated_at) "
+                    "VALUES('reader','tenant','reader','reader@iihs.ac.in','Reader','EMPLOYEE','ACTIVE','now','now')"
+                )
+                cookie = create_session(db, "reader", self.settings)
+                db.commit()
+                db.close()
+                client.cookies.set(SESSION_COOKIE, cookie)
+                response = client.post("/api/search", json={"query": "cat", "mode": "keyword"})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual([(hit["name"], hit["reason"]) for hit in response.json()["hits"]],
+                                 [("cat.txt", "Has your words")])
 
     @unittest.skipUnless(CLI.is_file(), "the original DigUp CLI is not built")
     def test_kind_filter_is_applied_by_original_engine_before_limit(self) -> None:
@@ -327,7 +516,12 @@ class ArchiveContractTests(unittest.TestCase):
         result = asyncio.run(adapter.search("example", None, "keyword", 10, session_id="owner", code=True))
         self.assertTrue(adapter.search_process.request.await_args.kwargs["code"])
         self.assertEqual([row["name"] for row in result["hits"]], ["example.py"])
-        self.assertEqual(result["hits"][0]["location"], "line 3")
+        self.assertEqual(result["hits"][0]["location"], "lines 3–4")
+        for segment, end, expected in (("lines", 3, "line 3"), ("cells", 5, "cells 3–5"),
+                                       ("cells", None, "cell 3")):
+            with self.subTest(segment=segment, end=end):
+                source_hit = {**hit(code), "segment": segment, "loc_end": end}
+                self.assertEqual(adapter._register_hit(source_hit, "owner", code=True)["location"], expected)
         self.assertNotIn(str(code_root), str(result))
         handle = result["hits"][0]["id"]
         with self.assertRaises(MediaNotFound):
@@ -430,6 +624,40 @@ class ArchiveContractTests(unittest.TestCase):
             self.assertEqual(response.status_code, 206)
             self.assertEqual(response.content, b"synthetic")
             self.assertEqual(response.headers["content-type"], "audio/mpeg")
+
+    def test_pdf_pages_and_video_frames_use_original_render_operation(self) -> None:
+        pdf = self.root / "sample.pdf"
+        video = self.root / "sample.mp4"
+        pdf.write_bytes(b"synthetic pdf")
+        video.write_bytes(b"synthetic video")
+        previews = self.index / "previews"
+        previews.mkdir(parents=True)
+        image = previews / "preview.jpg"
+        image.write_bytes(b"synthetic preview")
+        adapter = DigUpAdapter(EngineSettings(
+            executable=self.workspace / "missing", index_dir=self.index, model_dir=self.workspace / "models",
+            roots=(self.root,),
+        ))
+        adapter.search_process.request = AsyncMock(return_value={"image": str(image)})
+        pdf_hit = adapter._register_hit({"path": str(pdf), "kind": "pdf", "info": {"pages": "3"}}, "owner")
+        video_hit = adapter._register_hit({"path": str(video), "kind": "video", "info": {"duration": "10"}}, "owner")
+
+        async def verify() -> None:
+            self.assertEqual(await adapter.render(pdf_hit["id"], at=2, pixels=512, session_id="owner"), image)
+            self.assertEqual(adapter.search_process.request.await_args.kwargs["kind"], "pdf")
+            self.assertEqual(adapter.search_process.request.await_args.kwargs["loc"], 2)
+            self.assertEqual(await adapter.render(video_hit["id"], at=7.5, pixels=512,
+                                                  session_id="owner", frame_only=True), image)
+            self.assertEqual(adapter.search_process.request.await_args.kwargs["kind"], "video")
+            self.assertEqual(adapter.search_process.request.await_args.kwargs["loc"], 7.5)
+            with self.assertRaises(ValueError):
+                await adapter.render(pdf_hit["id"], at=4, pixels=512, session_id="owner")
+            with self.assertRaises(ValueError):
+                await adapter.render(video_hit["id"], at=11, pixels=512, session_id="owner", frame_only=True)
+            with self.assertRaises(MediaNotFound):
+                await adapter.render(video_hit["id"], at=1, pixels=512, session_id="other", frame_only=True)
+
+        asyncio.run(verify())
 
 
 if __name__ == "__main__":

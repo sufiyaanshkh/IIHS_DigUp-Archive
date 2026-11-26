@@ -1,0 +1,10 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        ARCHIVE_API_ORIGIN: ${ARCHIVE_API_ORIGIN:?Set a secure container-reachable host backend origin}
+    environment:
+      ARCHIVE_API_ORIGIN: ${ARCHIVE_API_ORIGIN:?Set a secure container-reachable host backend origin}
+    ports:
+      - "127.0.0.1:3017:3017"

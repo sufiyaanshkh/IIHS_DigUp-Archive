@@ -12,7 +12,7 @@ type Props = {
 
 export function ResultFilters({ active, counts, limit, onChange }: Props) {
   return (
-    <nav aria-label="Filter results by file kind" title={`Counts reflect up to ${limit} unfiltered results.`} className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-rule-grey/40 bg-white px-4 py-2 sm:px-6">
+    <nav aria-label="Filter results by file kind" title={`Counts show strong matches among up to ${limit} unfiltered results.`} className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-rule-grey/40 bg-white px-4 py-2 sm:px-6">
       {resultKinds.map(({ id, label }) => {
         const selected = active === id;
         return (

@@ -4,11 +4,11 @@ import Image from "next/image";
 import Link from "next/link";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Activity, PanelRight, Search, Settings, Users, X } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { Button } from "@/components/ui/button";
 import { searchSchema, type SearchValues } from "@/lib/search-schema";
-import type { EngineStatus, IndexingStatus, SearchScope } from "@/lib/archive-types";
+import type { EnginePrewarm, EngineStatus, IndexingStatus, SearchScope } from "@/lib/archive-types";
 import { useSearchStore } from "@/store/search-store";
 import { SessionActions } from "@/components/auth/session-actions";
 
@@ -26,19 +26,26 @@ type Props = {
   hasSelection: boolean;
   engine: EngineStatus | undefined;
   engineLoading: boolean;
+  engineBusy: boolean;
+  engineError: string | null;
+  prewarmState: EnginePrewarm["encoder"] | undefined;
+  onPrewarm: () => void;
+  onReloadSearch: () => void;
   indexing: IndexingStatus | undefined;
   indexingLoading: boolean;
   indexingError: string | null;
   onStartIndexing: () => void;
   onStopIndexing: () => void;
+  onBackfillChange: (enabled: boolean) => void;
   indexingBusy: boolean;
 };
 
-export function ArchiveToolbar({ canManageArchive, canManageUsers, scope, onScopeChange, resultLimit, onResultLimitChange, previewOpen, onPreviewToggle, compactDetails, onCompactPreviewToggle, hasSelection, engine, engineLoading, indexing, indexingLoading, indexingError, onStartIndexing, onStopIndexing, indexingBusy }: Props) {
+export function ArchiveToolbar({ canManageArchive, canManageUsers, scope, onScopeChange, resultLimit, onResultLimitChange, previewOpen, onPreviewToggle, compactDetails, onCompactPreviewToggle, hasSelection, engine, engineLoading, engineBusy, engineError, prewarmState, onPrewarm, onReloadSearch, indexing, indexingLoading, indexingError, onStartIndexing, onStopIndexing, onBackfillChange, indexingBusy }: Props) {
   const query = useSearchStore((state) => state.query);
   const mode = useSearchStore((state) => state.mode);
   const setQuery = useSearchStore((state) => state.setQuery);
   const setMode = useSearchStore((state) => state.setMode);
+  const composing = useRef(false);
   const { register, control, setValue, formState: { errors } } = useForm<SearchValues>({
     resolver: zodResolver(searchSchema),
     mode: "onChange",
@@ -46,7 +53,7 @@ export function ArchiveToolbar({ canManageArchive, canManageUsers, scope, onScop
   });
   useEffect(() => setValue("query", query), [query, setValue]);
   const value = useWatch({ control, name: "query" });
-  const field = register("query", { onChange: (event) => setQuery(event.target.value) });
+  const field = register("query");
   const indexedCounts = indexing?.roots?.reduce((counts, root) => ({
     indexed: counts.indexed + root.indexed,
     pending: counts.pending + root.pending,
@@ -69,6 +76,21 @@ export function ArchiveToolbar({ canManageArchive, canManageUsers, scope, onScop
             aria-invalid={Boolean(errors.query)}
             aria-describedby={errors.query ? "search-error" : undefined}
             placeholder="Describe it: ‘a dog on the beach’, ‘the clause about pets’…"
+            onChange={(event) => {
+              void field.onChange(event);
+              if (!composing.current && !("isComposing" in event.nativeEvent && event.nativeEvent.isComposing === true)) {
+                setQuery(event.target.value);
+              }
+            }}
+            onCompositionStart={() => { composing.current = true; }}
+            onCompositionEnd={(event) => { composing.current = false; setQuery(event.currentTarget.value); }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && !event.nativeEvent.isComposing && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && query) {
+                event.preventDefault();
+                setValue("query", "");
+                setQuery("");
+              }
+            }}
             className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-ink/45 sm:text-[15px]"
           />
           {value ? (
@@ -136,6 +158,12 @@ export function ArchiveToolbar({ canManageArchive, canManageUsers, scope, onScop
               </div>
               <span className={`mt-1 size-2 shrink-0 rounded-full ${engine ? "bg-emerald-600" : "bg-rule-grey"}`} aria-label={engine ? "Connected" : "Disconnected"} />
             </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button type="button" variant="outline" size="small" disabled={engineBusy || !engine} onClick={onPrewarm}>Prewarm search</Button>
+              <Button type="button" variant="outline" size="small" disabled={engineBusy || !engine || ["starting", "scanning", "indexing", "waiting", "stopping"].includes(indexing?.state ?? "")} onClick={onReloadSearch}>Reload search</Button>
+            </div>
+            {prewarmState ? <p role="status" className="mt-1 text-xs text-ink/60">Encoder: {prewarmState}</p> : null}
+            {engineError ? <p role="alert" className="mt-2 text-xs text-brick">{engineError}</p> : null}
             <div className="mt-4 border-t border-rule-grey/35 pt-3">
               <div className="flex items-center justify-between gap-3">
                 <div>
@@ -145,13 +173,20 @@ export function ArchiveToolbar({ canManageArchive, canManageUsers, scope, onScop
                 {indexing?.state === "starting" || indexing?.state === "scanning" || indexing?.state === "indexing" || indexing?.state === "waiting" || indexing?.state === "stopping" ? (
                   <Button type="button" variant="outline" size="small" disabled={indexingBusy || indexing?.state === "stopping"} onClick={onStopIndexing}>Stop</Button>
                 ) : (
-                  <Button type="button" size="small" disabled={indexingBusy || !engine} onClick={onStartIndexing}>Index sources</Button>
+                  <Button type="button" size="small" disabled={indexingBusy || !engine || indexing?.sync_available !== true} onClick={onStartIndexing}>Index sources</Button>
                 )}
               </div>
+              {indexing && ["starting", "scanning", "indexing", "waiting"].includes(indexing.state) && typeof indexing.backfill_requested === "boolean" ? <div className="mt-2">
+                <Button type="button" variant="outline" size="small" disabled={indexingBusy || indexing.state === "starting"}
+                  onClick={() => onBackfillChange(!indexing.backfill_requested)}>
+                  {indexing.backfill_requested ? "Pause backfill" : "Resume backfill"}
+                </Button>
+                <p className="mt-1 text-xs text-ink/60">{indexing.backfill_requested ? "Backfill requested." : "Backfill pause requested."} Newly found files may still be processed.</p>
+              </div> : null}
               {indexingError ? <p role="alert" className="mt-2 text-xs text-brick">{indexingError}</p> : null}
               {indexing?.error ? <p role="alert" className="mt-2 text-xs text-brick">{indexing.error}</p> : null}
               {indexing?.files?.length ? <ul aria-label="Recent indexing events" className="mt-3 max-h-36 space-y-1 overflow-auto border-t border-rule-grey/35 pt-2 text-[11px] text-ink/65">{indexing.files.slice(-6).reverse().map((file, index) => <li key={`${file.name}-${index}`} className="flex justify-between gap-2"><span className="truncate">{file.name}</span><span className="shrink-0">{file.state ?? file.kind ?? "processed"}</span></li>)}</ul> : null}
-              <p className="mt-3 text-xs leading-5 text-ink/70">Indexes the folders selected in Settings. Browser file uploads are not available.</p>
+              <p className="mt-3 text-xs leading-5 text-ink/70">{indexing?.sync_unavailable_reason ?? "Indexing availability could not be verified. Browser file uploads are not available."}</p>
             </div>
           </section>
         </details> : null}
